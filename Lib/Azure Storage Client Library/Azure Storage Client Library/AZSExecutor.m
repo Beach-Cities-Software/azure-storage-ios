@@ -29,6 +29,7 @@
 #import "AZSRetryInfo.h"
 #import "AZSUtil.h"
 #import "AZSStorageCredentials.h"
+#import <Foundation/Foundation.h>
 
 @interface AZSStreamDownloadBuffer : NSObject <NSStreamDelegate>
 {
@@ -492,7 +493,9 @@
         
         // TODO: Set this if necessary (if we use a session for more than one request at once).
         // sessionConfiguration.HTTPMaximumConnectionsPerHost = ?
-        // Do we need to set min/max TLS protocol version?
+        
+        // require minimum TLS version 1.2
+        sessionConfiguration.TLSMinimumSupportedProtocol = kTLSProtocol12;
         
         // 5. Initiate request, possibly uploading data
         // TODO: Decide what to do about the delegate queue - should we have greater control over this?  Should we allow users to pass in a delegate queue?
@@ -695,6 +698,53 @@
         
         [self finishRequestWithSession:session error:error retval:retval];
     }
+}
+
+// MARK: - NSURLSessionDelegate
+
+- (void)URLSession:(NSURLSession *)session
+didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
+ completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential * _Nullable))completionHandler {
+    
+    // ensure certificate pinning
+    if (challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust)
+    {
+        NSLog(@"Checking SSL Pinning for host: %@, with method: %@", challenge.protectionSpace.host, challenge.protectionSpace.authenticationMethod);
+        SecTrustRef serverTrust = challenge.protectionSpace.serverTrust;
+        if (serverTrust)
+        {
+            SecTrustResultType result = kSecTrustResultInvalid;
+            if (SecTrustEvaluate(serverTrust, &result) == errSecSuccess && (kSecTrustResultUnspecified == result || kSecTrustResultProceed == result))
+            {
+                SecCertificateRef serverCertificate = SecTrustGetCertificateAtIndex(serverTrust, 0);
+                if (serverCertificate)
+                {
+                    CFStringRef certificateSubject = SecCertificateCopySubjectSummary(serverCertificate);
+                    NSLog(@"Checking SSL cert with CN: %@", (__bridge NSString *)certificateSubject);
+                    CFRelease(certificateSubject);
+                    CFDataRef certificateData = SecCertificateCopyData(serverCertificate);
+                    const UInt8 *data = CFDataGetBytePtr(certificateData);
+                    CFIndex size = CFDataGetLength(certificateData);
+                    NSData *cert1 = [NSData dataWithBytes:data length:size];
+                    NSString *fileDer = [[NSBundle mainBundle] pathForResource:@"AzurePublicKey" ofType:@"cer"];
+                    if (fileDer)
+                    {
+                        NSData *cert2 = [NSData dataWithContentsOfFile:fileDer];
+                        if ([cert1 isEqualToData:cert2])
+                        {
+                            NSLog(@"SSL Pinning Successful!");
+                            completionHandler(NSURLSessionAuthChallengeUseCredential, [NSURLCredential credentialForTrust:serverTrust]);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    NSLog(@"SSL Pinning failed!");
+    // pinning failed
+    completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
 }
 
 -(void)URLSession:(NSURLSession *)session didBecomeInvalidWithError:(NSError *)error
